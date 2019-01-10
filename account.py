@@ -1,5 +1,5 @@
-from .client import Request
-from .suite import ReportSuite
+from client import Request
+from suite import ReportSuite
 
 
 class Account(object):
