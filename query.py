@@ -25,6 +25,7 @@ class Query(object):
         self._end_date = None
         self._metrics_filter = None
         self._dimension_filter = None
+        self._segments = None
         self._sort_mode = None
         self._limit = None
         self._page = 0
@@ -68,18 +69,23 @@ class Query(object):
 
         return self
 
-    def filter(self, metrics_filter=None, dimension_filter=None):
+    def with_segments(self, segments):
+        if not isinstance(segments, list):
+            raise QueryError("segments type should be list")
+
+        self._segments = segments
+
+        return self
+
+    def filter(self, dimension_filter):
         """Composes report quering conditions.
 
         Args:
-            metrics_filter (:obj:`list`, optional)
-            filters (:obj:`list`, optional)
+            dimension_filter (:obj:`DimensionFilter`)
         """
 
-        if metrics_filter and not isinstance(metrics_filter, list):
-            raise QueryError("metrics_filter type should be list")
-
-        self._metrics_filter = metrics_filter
+        if dimension_filter and not isinstance(dimension_filter, DimensionFilter):
+            raise QueryError("dimension_filter type should be DimensionFilter")
 
         self._dimension_filter = dimension_filter
 
@@ -109,17 +115,24 @@ class Query(object):
         self._page += 1
         self._translation['settings'].update({'page': str(self._page)})
 
-    def brakedown(self, dimensions):
-        """Breaks down the report based on the specified dimensions"""
-        pass
-
     def compile(self):
         if not self._dimension_id:
             raise QueryError("dimension_id must be specified")
 
+        if not self._start_date or not self._end_date:
+            raise QueryError(
+                "start_date and end_date are required by global filters")
+
+        global_filters = [{'type': 'dateRange',
+                           'dateRange': self._compose_date_range()}]
+
+        if self._segments:
+            for segment in self._segments:
+                global_filters.append(
+                    {'type': 'segment', 'segmentId': segment})
+
         self._translation = {'rsid': self._suite_id,
-                             'globalFilters': [{'type': 'dateRange',
-                                                'dateRange': self._compose_date_range()}],
+                             'globalFilters': global_filters,
                              'metricContainer': {'metrics': self._compose_metric_container()},
                              'metricFilters': self._compose_metrics_filters(),
                              'dimension': self._dimension_id,
@@ -131,15 +144,39 @@ class Query(object):
 
         return self._translation
 
+    @staticmethod
+    def brakedown_filters(dimensions):
+        """Breaks down the report based on the specified dimensions"""
+        if not isinstance(dimensions, dict):
+            raise QueryError("dimensions type should be dict")
+
+        metrics_filter = []
+
+        for dimension, items_ids in dimensions.items():
+            metric_filter = MetricFilter(
+                FilterType.breakdown, (dimension, items_ids,))
+            metrics_filter.append(metric_filter)
+
+        return metrics_filter
+
     def _compose_date_range(self):
         return "{}/{}".format(self._start_date.isoformat(), self._end_date.isoformat())
 
     def _compose_metrics_filters(self):
+        self._metrics_filter = []
+        exists = {}
+        for metric in self._metrics:
+            for filter in metric.filters:
+                if filter.id not in exists:
+                    exists[filter.id] = filter
+                    self._metrics_filter.append(filter)
+
         filters = []
 
         for filter in self._metrics_filter:
             output = filter.compile()
             filters.append(output)
+
         return filters
 
     def _compose_metric_container(self):
@@ -183,7 +220,9 @@ class Metric(object):
         if filters and not isinstance(filters, list):
             raise QueryError("filters type should be list")
 
-        self._filters = filters
+        self._filters = []
+        if filters:
+            self._filters = filters
 
     @property
     def id(self):
@@ -201,16 +240,23 @@ class Metric(object):
         pass
 
 
-FilterType = Enum('FilterType', 'dateRange segment')
+FilterType = Enum('FilterType', 'dateRange segment breakdown')
 
 
 class MetricFilter(object):
     _type_map = {FilterType.dateRange: 'dateRange',
-                 FilterType.segment: 'segmentId'}
+                 FilterType.segment: 'segmentId',
+                 FilterType.breakdown: 'breakdown'}
 
-    def __init__(self, filter_type, value):
-        self._id = urandom(8).encode('hex')
+    def __init__(self, filter_type, value, id=None):
+        self._id = urandom(8).encode('hex') if not id else id
         self._filter_type = filter_type
+        # Attr value data structure depends on filter type (e.g.: dimension, granularity, etc)
+
+        if filter_type == FilterType.breakdown and not isinstance(value, tuple):
+            raise QueryError(
+                "for breakdown filter `value` arg should be a tuple with dimension id and rows ids")
+
         self._value = value
 
     @property
@@ -229,12 +275,23 @@ class MetricFilter(object):
         return MetricFilter._type_map[self._filter_type]
 
     def _compose_type_key(self):
+        if self._filter_type == FilterType.breakdown:
+            return 'dimension'
+
         return MetricFilter._type_map[self._filter_type]
 
     def compile(self):
-        return {'id': self._id,
-                'type': self._compose_type(),
-                self._compose_type_key(): self._value}
+        metric_filter_map = {'id': self._id,
+                             'type': self._compose_type()}
+
+        if self._filter_type == FilterType.breakdown:
+            metric_filter_map.update(
+                {self._compose_type_key(): self._value[0], 'itemIds': self.value[1]})
+        else:
+            metric_filter_map.update(
+                {self._compose_type_key(): self._value})
+
+        return metric_filter_map
 
 
 class DimensionFilter(object):
@@ -349,7 +406,7 @@ class Clause(object):
     Conjunction = Enum('Conjunction', 'and_ or_ not_')
     _operator_map = {Operator.match: 'MATCH',
                      Operator.contains: 'CONTAINS',
-                     Operator.begins_with: 'BEGINGS-WITH',
+                     Operator.begins_with: 'BEGINS-WITH',
                      Operator.ends_with: 'ENDS-WITH'}
 
     _conjunction_map = {Conjunction.and_: 'AND',
